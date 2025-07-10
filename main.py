@@ -65,6 +65,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file = await update.message.document.get_file()
         file_path = f"/tmp/input_{update.message.document.file_id}.xlsx"
         await file.download_to_drive(file_path)
+        output_path = f"/tmp/result_{update.message.document.file_id}.xlsx"
         try:
             df = pd.read_excel(file_path)
             if df.shape[1] < 1:
@@ -101,16 +102,26 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await status_msg.edit_text("Đã huỷ tiến trình bởi người dùng.")
                         return
 
+            # Tạo file Excel kết quả
             result_df = pd.DataFrame(results)
-            output_path = f"/tmp/result_{update.message.document.file_id}.xlsx"
             result_df.to_excel(output_path, index=False)
-            await update.message.reply_document(InputFile(output_path, filename="result.xlsx"))
+
+            # GỬI FILE KẾT QUẢ (luôn gửi dưới dạng document)
+            with open(output_path, "rb") as f:
+                await update.message.reply_document(InputFile(f, filename="result.xlsx"))
+
             await update.message.reply_text("Đã hoàn tất. Đã gửi file kết quả.")
         except Exception as e:
             await update.message.reply_text(f"Lỗi xử lý file: {e}")
         finally:
-            try: os.remove(file_path)
-            except: pass
+            # Xoá file tạm chỉ sau khi đã gửi xong
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+            except:
+                pass
 
     # Lưu task để có thể cancel
     task = asyncio.create_task(run_processing())
