@@ -1,31 +1,41 @@
 import os
 import pandas as pd
-import requests
+import asyncio
+import aiohttp
 from telegram import Update, InputFile
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 PAGESPEED_API_KEY = os.getenv("PAGESPEED_API_KEY")
 
-def get_performance_score(url):
+# Google cho phép tối đa 4 requests/giây trên 1 API key miễn phí
+GOOGLE_RPS_LIMIT = 4         # requests per second (tối đa)
+MAX_CONCURRENCY = 20         # bảo vệ server tránh quá tải, và để mở rộng nếu nâng quota
+
+def get_concurrent_limit(num_links):
+    # Chỉ dùng đủ số luồng cần thiết, không vượt Google quota, và không vượt MAX_CONCURRENCY
+    return min(GOOGLE_RPS_LIMIT, num_links, MAX_CONCURRENCY)
+
+async def get_performance_score_async(session, url, semaphore):
     api_url = (
         f"https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
         f"?url={url}&strategy=mobile&key={PAGESPEED_API_KEY}"
     )
-    try:
-        r = requests.get(api_url, timeout=30)
-        data = r.json()
-        if 'error' in data:
-            return None, f"error: {data['error'].get('message', '')}"
-        if "lighthouseResult" in data and \
-           "categories" in data["lighthouseResult"] and \
-           "performance" in data["lighthouseResult"]["categories"]:
-            score = data["lighthouseResult"]["categories"]["performance"]["score"]
-            if score is not None:
-                score_int = int(round(score * 100))
-                return score_int, "ok" if score_int >= 80 else "not ok"
-        return None, "no performance data"
-    except Exception as e:
-        return None, f"error: {str(e)}"
+    async with semaphore:
+        try:
+            async with session.get(api_url, timeout=30) as r:
+                data = await r.json()
+                if 'error' in data:
+                    return url, None, f"error: {data['error'].get('message', '')}"
+                if "lighthouseResult" in data and \
+                   "categories" in data["lighthouseResult"] and \
+                   "performance" in data["lighthouseResult"]["categories"]:
+                    score = data["lighthouseResult"]["categories"]["performance"]["score"]
+                    if score is not None:
+                        score_int = int(round(score * 100))
+                        return url, score_int, "ok" if score_int >= 80 else "not ok"
+                return url, None, "no performance data"
+        except Exception as e:
+            return url, None, f"error: {str(e)}"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Gửi file Excel (.xlsx) chứa danh sách URL (cột đầu tiên) vào đây.")
@@ -51,26 +61,30 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Không tìm thấy URL nào trong file.")
             return
 
-        # 1. THÔNG BÁO đã nhận file và số link sẽ xử lý
         await update.message.reply_text(f"Đã nhận file. Tổng số link sẽ xử lý: {len(urls)}")
+        concurrent_limit = get_concurrent_limit(len(urls))
+        status_msg = await update.message.reply_text(
+            f"Bắt đầu kiểm tra link (tối đa {concurrent_limit} luồng song song, tối đa {GOOGLE_RPS_LIMIT} request/giây)..."
+        )
 
-        result = []
-        # Gửi tin nhắn trạng thái để cập nhật liên tục
-        status_msg = await update.message.reply_text("Bắt đầu kiểm tra link...")
+        # Xử lý song song nhưng không vượt quá quota Google (thực tế vẫn nên delay nhẹ tránh burst)
+        results = []
+        semaphore = asyncio.Semaphore(concurrent_limit)
+        async with aiohttp.ClientSession() as session:
+            tasks = [get_performance_score_async(session, url, semaphore) for url in urls]
+            for idx, coro in enumerate(asyncio.as_completed(tasks), 1):
+                url, perf, status = await coro
+                results.append({
+                    "STT": idx,
+                    "URL": url,
+                    "Performance": perf if perf is not None else "N/A",
+                    "Status": status,
+                })
+                # Log sau mỗi 10 link hoặc cuối cùng
+                if idx % 10 == 0 or idx == len(urls):
+                    await status_msg.edit_text(f"Đã xử lý {idx}/{len(urls)} link...")
 
-        for idx, url in enumerate(urls, 1):
-            perf, status = get_performance_score(url)
-            result.append({
-                "STT": idx,
-                "URL": url,
-                "Performance": perf if perf is not None else "N/A",
-                "Status": status,
-            })
-            # Cập nhật log mỗi 2 link, hoặc link cuối
-            if idx % 2 == 0 or idx == len(urls):
-                await status_msg.edit_text(f"Đã xử lý {idx}/{len(urls)} link...")
-
-        result_df = pd.DataFrame(result)
+        result_df = pd.DataFrame(results)
         output_path = f"/tmp/result_{update.message.document.file_id}.xlsx"
         result_df.to_excel(output_path, index=False)
         await update.message.reply_document(InputFile(output_path, filename="result.xlsx"))
