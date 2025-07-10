@@ -28,7 +28,7 @@ def get_performance_score(url):
         return None, f"error: {str(e)}"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Gửi file Excel (.xlsx) chứa cột URL (dòng đầu tiên) vào đây.")
+    await update.message.reply_text("Gửi file Excel (.xlsx) chứa danh sách URL (cột đầu tiên) vào đây.")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.document:
@@ -50,7 +50,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not urls:
             await update.message.reply_text("Không tìm thấy URL nào trong file.")
             return
+
+        # 1. THÔNG BÁO đã nhận file và số link sẽ xử lý
+        await update.message.reply_text(f"Đã nhận file. Tổng số link sẽ xử lý: {len(urls)}")
+
         result = []
+        # Gửi tin nhắn trạng thái để cập nhật liên tục
+        status_msg = await update.message.reply_text("Bắt đầu kiểm tra link...")
+
         for idx, url in enumerate(urls, 1):
             perf, status = get_performance_score(url)
             result.append({
@@ -59,10 +66,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Performance": perf if perf is not None else "N/A",
                 "Status": status,
             })
+            # Cập nhật log mỗi 2 link, hoặc link cuối
+            if idx % 2 == 0 or idx == len(urls):
+                await status_msg.edit_text(f"Đã xử lý {idx}/{len(urls)} link...")
+
         result_df = pd.DataFrame(result)
         output_path = f"/tmp/result_{update.message.document.file_id}.xlsx"
         result_df.to_excel(output_path, index=False)
         await update.message.reply_document(InputFile(output_path, filename="result.xlsx"))
+        await update.message.reply_text("Đã hoàn tất. Đã gửi file kết quả.")
     except Exception as e:
         await update.message.reply_text(f"Lỗi xử lý file: {e}")
     finally:
@@ -73,6 +85,9 @@ def main():
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not bot_token:
         print("Lỗi: Chưa thiết lập biến môi trường TELEGRAM_BOT_TOKEN")
+        exit(1)
+    if not PAGESPEED_API_KEY:
+        print("Lỗi: Chưa thiết lập biến môi trường PAGESPEED_API_KEY")
         exit(1)
     app = ApplicationBuilder().token(bot_token).build()
     app.add_handler(CommandHandler("start", start))
